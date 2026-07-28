@@ -82,8 +82,8 @@ class MLSWeightExtractor:
         fs_local = fs_local_raw / Z_s_ev
 
         if self.model_A is None or self.reinstate_nn:
-            self.model_A = PureDNN(input_dim=n_ctrl_dims + 1, use_relu=self.use_relu).to(self.device)
-            self.model_B = PureDNN(input_dim=n_ctrl_dims, use_relu=self.use_relu).to(self.device)
+            self.model_A = PureDNN(input_dim=n_ctrl_dims + 1, use_relu=self.use_relu,hidden_dim=256,num_layers=5).to(self.device)
+            self.model_B = PureDNN(input_dim=n_ctrl_dims, use_relu=self.use_relu,hidden_dim=256,num_layers=5).to(self.device)
 
         stable_iters = 0
         required_stable_iters = 3
