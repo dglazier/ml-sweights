@@ -75,7 +75,6 @@ class MLSWeightExtractor:
         fb_base_grid_t = torch.tensor(f_bkg_1d(self.y_grid_cpu), dtype=torch.float32, device=self.device)
         fb_global_t = torch.tensor(f_bkg_1d(y_disc), dtype=torch.float32, device=self.device)
         
-        # FIX: f_sig_cond trained on Z_ctrl, MUST receive Z_ctrl
         fs_local_raw_cpu = f_sig_cond(Z_ctrl, y_disc) 
         fs_local_raw_t = torch.tensor(fs_local_raw_cpu, dtype=torch.float32, device=self.device)
         
@@ -92,7 +91,6 @@ class MLSWeightExtractor:
         ], dim=1)
 
         if self.model_A is None or self.reinstate_nn:
-            # FIX: Ensure capacity is maintained when reinstating
             self.model_A = PureDNN(input_dim=n_ctrl_dims + 1, use_relu=self.use_relu, hidden_dim=256, num_layers=5).to(self.device)
             self.model_B = PureDNN(input_dim=n_ctrl_dims, use_relu=self.use_relu, hidden_dim=256, num_layers=5).to(self.device)
 
@@ -191,7 +189,6 @@ class MLSWeightExtractor:
                 R_GBDT_data_t = torch.ones(N_tot, device=self.device)
                 R_GBDT_grid_t = torch.ones((N_tot, self.n_nodes), device=self.device)
             
-            # GPU-Native Vectorized Margin Corrections
             R_raw_data_t = torch.clamp(R_DNN_data_t * R_GBDT_data_t, 1e-4, 1e4)
             R_raw_grid_t = torch.clamp(R_DNN_grid_t * R_GBDT_grid_t, 1e-4, 1e4)
             
@@ -211,7 +208,6 @@ class MLSWeightExtractor:
             Z_b_ev_t = torch.sum(R_final_grid_t * fb_base_grid_t * dy_weights_t, dim=1)
             fb_local_t = (fb_global_t * R_final_data_t) / torch.clamp(Z_b_ev_t, min=1e-12)
             
-            # Model B
             X_train_B = torch.cat([Z_ctrl_t, Z_ctrl_t], dim=0).cpu().numpy()
             y_train_B = np.concatenate([np.ones(N_tot), np.zeros(N_tot)])
             w_train_B_dnn = np.concatenate([w_s_prev_t.cpu().numpy(), w_b_cpu])
@@ -250,7 +246,6 @@ class MLSWeightExtractor:
             
             A_final_data_t = A_DNN_data_t * A_GBDT_data_t
             
-            # GPU-Native Bayesian Update & Metrics
             w_s_safe_t = torch.clamp(w_s_prev_t, min=1e-10)
             log_A_t = torch.log(torch.clamp(A_final_data_t, min=1e-8, max=1e8))
             kl_divergence = (torch.sum(w_s_safe_t * log_A_t) / torch.sum(w_s_safe_t)).item()
@@ -262,6 +257,11 @@ class MLSWeightExtractor:
             current_Ns = torch.sum(w_s_t).item()
             yield_history.append(current_Ns)
             delta_Ns = current_Ns - torch.sum(w_s_prev_t).item()
+            
+            # -------------------------------------------------------------
+            # CORRECTION: MACROSCOPIC YIELD STABILIZATION (Yield Shift vs delta_w)
+            # -------------------------------------------------------------
+            fractional_yield_shift = abs(delta_Ns) / max(current_Ns, 1.0)
             delta_w = torch.mean(torch.abs(w_s_t - w_s_prev_t)).item()
             
             if cooldown > 0:
@@ -278,7 +278,6 @@ class MLSWeightExtractor:
                     current_alpha = max(0.0, current_alpha - 0.05)
                     cooldown = 2
             
-            # Diagnostics & Plotting 
             if validation_data is not None:
                 from utils.diagnostics import get_chi2
                 w_s_cpu = w_s_t.cpu().numpy()
@@ -287,7 +286,7 @@ class MLSWeightExtractor:
                 current_metric = np.mean(chi2s) 
                 
                 logger.info(f"Iter {it:02d} [ω={omega_curr:.2f}, α={current_alpha:.2f}] | S: {current_Ns:.0f} (dNs: {delta_Ns:+.0f}) | "
-                            f"Chi2: [{chi2_str}] | <KL>: {kl_divergence:.4f} | Conv dW: {delta_w:.5f}")
+                            f"Chi2: [{chi2_str}] | <KL>: {kl_divergence:.4f} | Yield Shift: {fractional_yield_shift:.5f}")
 
                 if validation_data.get('plot_iterations', False):
                     from utils.diagnostics import plot_dynamic_iteration
@@ -300,9 +299,14 @@ class MLSWeightExtractor:
                         validation_data.get('y_raw', None), validation_data.get('y_bounds', None) 
                     )
             else:
-                current_metric = delta_w 
+                # -------------------------------------------------------------
+                # CORRECTION: METRIC WITHOUT VALIDATION DATA (Penalize KL drops)
+                # -------------------------------------------------------------
+                # We want small yield shifts and high KL (to avoid cannibalization).
+                # Subtracting KL means higher KL yields a smaller/better metric.
+                current_metric = fractional_yield_shift - (0.1 * kl_divergence)
                 logger.info(f"Iter {it:02d} [ω={omega_curr:.2f}, α={current_alpha:.2f}] | S: {current_Ns:.0f} (dNs: {delta_Ns:+.0f}) | "
-                            f"<KL>: {kl_divergence:.4f} | Conv dW: {delta_w:.5f}")
+                            f"<KL>: {kl_divergence:.4f} | Yield Shift: {fractional_yield_shift:.5f}")
             
             if it > 5:
                 if current_metric < min_metric:
@@ -319,18 +323,20 @@ class MLSWeightExtractor:
                         
                     best_iter = it
             
-            if delta_w < tol and it > 5:
+            # -------------------------------------------------------------
+            # CORRECTION: LOOP TERMINATION CRITERIA
+            # -------------------------------------------------------------
+            if fractional_yield_shift < tol and it > 5:
                 stable_iters += 1
             else:
                 stable_iters = 0
                 
             if stable_iters >= required_stable_iters:
-                logger.info(f"\n--> KINEMATIC STABILIZATION DETECTED.")
+                logger.info(f"\n--> MACROSCOPIC YIELD STABILIZATION DETECTED.")
                 break
                 
             w_s_prev_t = w_s_t.clone()
             
-            # Prevent GPU Memory Fragmentation from loop allocation
             if self.gbdt_mode == 'XGB_GPU':
                 del self.gbdt_A
                 del self.gbdt_B
@@ -343,7 +349,6 @@ class MLSWeightExtractor:
         self.model_A.load_state_dict(best_model_A_state)
         if best_gbdt_A is not None:
             self.gbdt_A = best_gbdt_A
-        # FIX: Call load_state to rewind dynamic flow calibration
         if hasattr(f_sig_cond, 'load_state') and best_sig_state is not None:
             f_sig_cond.load_state(best_sig_state)
         
@@ -369,13 +374,12 @@ class MLSWeightExtractor:
                 y_b = y_disc[start_idx:end_idx]
                 z_b = self.ml_transform(x_b) if self.ml_transform else x_b
                 
-                # 1. EVALUATE CONDITIONAL DENSITIES 
                 Z_eval_obs_t = torch.cat([
                     torch.tensor(z_b, dtype=torch.float32, device=self.device),
                     torch.tensor(y_b, dtype=torch.float32, device=self.device).unsqueeze(1)
                 ], dim=1)
                 
-                fs_obs_raw = f_sig_cond(z_b, y_b) # FIX: Use z_b for transformed flow matching
+                fs_obs_raw = f_sig_cond(z_b, y_b)
                 fb_base_obs = f_bkg_1d(y_b)
                 
                 R_dnn_obs = torch.exp(torch.clamp(self.model_A(Z_eval_obs_t), -15, 15)).cpu().numpy().flatten()
@@ -437,7 +441,6 @@ class MLSWeightExtractor:
                     
                 fb_grid_raw = (fb_base_grid * R_dnn_grid * R_gbdt_grid * correction_interp_grid).reshape(batch_len, self.n_nodes)
                 
-                # 2. STRICT NORMALIZATION
                 Z_s_ev = np.sum(fs_grid_raw * dy_weights_cpu, axis=1)
                 Z_b_ev = np.sum(fb_grid_raw * dy_weights_cpu, axis=1)
                 
@@ -447,7 +450,6 @@ class MLSWeightExtractor:
                 fs_cond_grid = fs_grid_raw / np.maximum(Z_s_ev[:, None], 1e-12)
                 fb_cond_grid = fb_grid_raw / np.maximum(Z_b_ev[:, None], 1e-12)
                 
-                # 3. LOCAL COWs VIA EVENT-BY-EVENT QUADRATURE INTEGRATION
                 I_grid = N_s * fs_cond_grid + N_b * fb_cond_grid
                 
                 W_ss_local = np.sum((fs_cond_grid**2 / np.maximum(I_grid, 1e-12)) * dy_weights_cpu, axis=1)
