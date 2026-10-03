@@ -120,10 +120,11 @@ sWeights_ML = extractor.fit_transform(
     f_sig_cond=user_signal_pdf, 
     f_bkg_1d=anchor['bkg_pdf'], 
     bkg_sampler=anchor['bkg_sampler'],
-    max_iters=40,
+    max_iters=150,
     validation_data=val_dict,
-    omega_init=1.5,
-    omega_decay_iters=20
+    tol=-1.0,
+    omega_init=2,
+    omega_decay_iters=40
 )
 
 # ====================================================================

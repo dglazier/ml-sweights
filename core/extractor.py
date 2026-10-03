@@ -362,6 +362,9 @@ class MLSWeightExtractor:
         sWeights_MD = np.zeros(N_tot)
         
         self.model_A.eval()
+        if self.model_B is not None:
+            self.model_B.eval()
+            
         y_grid_t, dy_weights_t = get_gauss_legendre_grid(self.y_min, self.y_max, n_nodes=self.n_nodes, device=self.device)
         dy_weights_cpu = dy_weights_t.cpu().numpy()
         
@@ -374,12 +377,35 @@ class MLSWeightExtractor:
                 y_b = y_disc[start_idx:end_idx]
                 z_b = self.ml_transform(x_b) if self.ml_transform else x_b
                 
+                # -------------------------------------------------------------
+                # BUG FIX: Evaluate Model B to get the Signal Morphing Ratio (A)
+                # -------------------------------------------------------------
+                z_b_t = torch.tensor(z_b, dtype=torch.float32, device=self.device)
+                if self.model_B is not None:
+                    A_dnn_obs = torch.exp(torch.clamp(self.model_B(z_b_t), -15, 15)).cpu().numpy().flatten()
+                    if getattr(self, 'gbdt_B', None) is not None:
+                        if self.gbdt_mode == 'XGB_GPU':
+                            p_gbdt_B = self.gbdt_B.predict_proba(z_b_t)[:, 1]
+                            if isinstance(p_gbdt_B, torch.Tensor): p_gbdt_B = p_gbdt_B.cpu().numpy()
+                            A_gbdt_obs = np.clip(p_gbdt_B, 1e-7, 1-1e-7) / (1.0 - np.clip(p_gbdt_B, 1e-7, 1-1e-7))
+                        elif self.gbdt_mode == 'SKLEARN':
+                            p_gbdt_B = np.clip(self.gbdt_B.predict_proba(z_b)[:, 1], 1e-7, 1-1e-7)
+                            A_gbdt_obs = p_gbdt_B / (1.0 - p_gbdt_B)
+                        else:
+                            A_gbdt_obs = np.ones(batch_len)
+                    else:
+                        A_gbdt_obs = np.ones(batch_len)
+                    A_final_obs = A_dnn_obs * A_gbdt_obs
+                else:
+                    A_final_obs = np.ones(batch_len)
+                
                 Z_eval_obs_t = torch.cat([
-                    torch.tensor(z_b, dtype=torch.float32, device=self.device),
+                    z_b_t,
                     torch.tensor(y_b, dtype=torch.float32, device=self.device).unsqueeze(1)
                 ], dim=1)
                 
-                fs_obs_raw = f_sig_cond(z_b, y_b)
+                # Apply the Morphing Ratio (A) to the conditional signal shape!
+                fs_obs_raw = f_sig_cond(z_b, y_b) * A_final_obs
                 fb_base_obs = f_bkg_1d(y_b)
                 
                 R_dnn_obs = torch.exp(torch.clamp(self.model_A(Z_eval_obs_t), -15, 15)).cpu().numpy().flatten()
@@ -412,7 +438,9 @@ class MLSWeightExtractor:
                 z_b_repeated = np.repeat(z_b, self.n_nodes, axis=0)
                 y_tiled = np.tile(self.y_grid_cpu, batch_len)
                 
-                fs_grid_raw = f_sig_cond(z_b_repeated, y_tiled).reshape(batch_len, self.n_nodes)
+                # Apply the Morphing Ratio (A) to the integration grid!
+                fs_grid_raw = f_sig_cond(z_b_repeated, y_tiled).reshape(batch_len, self.n_nodes) * A_final_obs[:, None]
+                
                 Z_eval_grid_t = torch.cat([
                     torch.tensor(z_b_repeated, dtype=torch.float32, device=self.device),
                     torch.tensor(y_tiled, dtype=torch.float32, device=self.device).unsqueeze(1)
@@ -441,6 +469,7 @@ class MLSWeightExtractor:
                     
                 fb_grid_raw = (fb_base_grid * R_dnn_grid * R_gbdt_grid * correction_interp_grid).reshape(batch_len, self.n_nodes)
                 
+                # Strict Normalization
                 Z_s_ev = np.sum(fs_grid_raw * dy_weights_cpu, axis=1)
                 Z_b_ev = np.sum(fb_grid_raw * dy_weights_cpu, axis=1)
                 
@@ -450,6 +479,7 @@ class MLSWeightExtractor:
                 fs_cond_grid = fs_grid_raw / np.maximum(Z_s_ev[:, None], 1e-12)
                 fb_cond_grid = fb_grid_raw / np.maximum(Z_b_ev[:, None], 1e-12)
                 
+                # Local COWs Integration
                 I_grid = N_s * fs_cond_grid + N_b * fb_cond_grid
                 
                 W_ss_local = np.sum((fs_cond_grid**2 / np.maximum(I_grid, 1e-12)) * dy_weights_cpu, axis=1)
