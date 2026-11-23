@@ -1,3 +1,4 @@
+# core/networks.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,6 +7,32 @@ import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def map_trig_topology(x, cos_theta_indices=(0,), periodic_phi_indices=(1, 2), passthrough_indices=()):
+    """
+    Maps periodic angles into continuous sine/cosine components while passing through
+    both explicitly specified passthrough_indices and any trailing columns (e.g.
+    remaining discriminating variables y_{j > k} appended during sequential unfolding).
+    """
+    features = []
+    for idx in cos_theta_indices:
+        cT = x[:, idx:idx + 1]
+        sT = np.sqrt(np.maximum(1.0 - cT**2, 0.0))
+        features.extend([cT, sT])
+    for idx in periodic_phi_indices:
+        ang = x[:, idx:idx + 1]
+        features.extend([np.cos(ang), np.sin(ang)])
+    for idx in passthrough_indices:
+        features.append(x[:, idx:idx + 1])
+
+    all_explicit = list(cos_theta_indices) + list(periodic_phi_indices) + list(passthrough_indices)
+    max_explicit = max(all_explicit) if all_explicit else -1
+    if x.shape[1] > max_explicit + 1:
+        features.append(x[:, max_explicit + 1:])
+
+    return np.hstack(features)
+
 
 class PureDNN(nn.Module):
     def __init__(self, input_dim, use_relu=True, hidden_dim=128, num_layers=4):
@@ -25,14 +52,15 @@ class PureDNN(nn.Module):
     def forward(self, x):
         return self.network(x)
 
+
 def train_dnn(model, X_train, y_train, w_train, device, epochs=100, batch_size=32768, 
-              lr=0.001, patience=5, min_delta=1e-4, loss_fn='BCE', logit_l2_penalty=0.0):
+              lr=0.001, patience=5, min_delta=1e-4, loss_fn='BCE', logit_l2_penalty=0.0,
+              optimizer_type='Adam'):
     """
-    Trains the DNN with Autonomous Early Stopping evaluated on a 90/10 validation split.
-    Autonomously handles VRAM loading or asynchronous PCIe transfers if data is too large.
+    Trains the DNN. Supports stochastic Adam with early stopping, or 
+    deterministic full-batch L-BFGS for exact mathematical optimization.
+    Exactly respects signed weights in w_train without clipping or distortion.
     """
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    
     in_vram = True
     
     # 1. ATTEMPT TO PUSH ENTIRE DATASET TO VRAM
@@ -58,23 +86,12 @@ def train_dnn(model, X_train, y_train, w_train, device, epochs=100, batch_size=3
         y_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
         w_t = torch.tensor(w_train, dtype=torch.float32).unsqueeze(1)
         dataset = TensorDataset(X_t, y_t, w_t)
-        
-    # 3. CREATE 90/10 VALIDATION SPLIT
-    val_size = int(0.1 * len(dataset))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    
-    if in_vram:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=2)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=2)
 
     def compute_loss(logits, y_batch, w_batch):
         """Helper to calculate loss consistently across Train and Val loops"""
         if loss_fn == 'BCE':
             criterion = nn.BCEWithLogitsLoss(weight=None, reduction='none')
+            # Natively applies negative weights to the BCE gradient
             loss = torch.mean(criterion(logits, y_batch) * w_batch)
         elif loss_fn == 'uLSIF':
             R = torch.exp(torch.clamp(logits, -15.0, 15.0))
@@ -100,11 +117,47 @@ def train_dnn(model, X_train, y_train, w_train, device, epochs=100, batch_size=3
             
         return loss
 
+    # ==============================================================================
+    # DETERMINISTIC FULL-BATCH OPTIMIZATION
+    # ==============================================================================
+    if optimizer_type == 'LBFGS':
+        if not in_vram:
+            logger.warning("L-BFGS requires the full dataset in VRAM. Falling back to Adam.")
+            optimizer_type = 'Adam'
+        else:
+            optimizer = optim.LBFGS(model.parameters(), lr=1.0, max_iter=epochs, line_search_fn="strong_wolfe")
+            
+            def closure():
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(X_t)
+                loss = compute_loss(logits, y_t, w_t)
+                loss.backward()
+                return loss
+                
+            model.train()
+            optimizer.step(closure)
+            return model
+
+    # ==============================================================================
+    # STOCHASTIC BATCH OPTIMIZATION
+    # ==============================================================================
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    val_size = int(0.1 * len(dataset))
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    
+    if in_vram:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=2)
+
     best_loss = float('inf')
     epochs_no_improve = 0
     
     for epoch in range(epochs):
-        # --- TRAINING PHASE ---
         model.train()
         for X_batch, y_batch, w_batch in train_loader:
             if not in_vram:
@@ -137,7 +190,6 @@ def train_dnn(model, X_train, y_train, w_train, device, epochs=100, batch_size=3
                 
         avg_val_loss = val_loss / max(1, batch_count)
         
-        # Monitor Validation Loss to prevent statistical overfitting
         if avg_val_loss < (best_loss - min_delta):
             best_loss = avg_val_loss
             epochs_no_improve = 0
@@ -148,6 +200,7 @@ def train_dnn(model, X_train, y_train, w_train, device, epochs=100, batch_size=3
             break
             
     return model
+
 
 def predict_in_batches(model, X_tensor, batch_size=32768):
     """Helper function to process large datasets through the DNN."""
