@@ -7,9 +7,9 @@ This repository provides a multidimensional, non-parametric Machine Learning fra
 Standard analytical background subtraction tools—such as the classic 1D sPlot method—depend strictly on the assumption of **factorization** between the discriminating variable (typically invariant mass `y`) and the control variables (angular kinematics `x`). In modern high-precision experimental environments, physical acceptance boundaries, detector resolution stretching, and moving kinematic thresholds create severe, non-factorizable correlations.
 
 To decouple these complex correlations without relying on rigid, global parametric assumptions, this algorithm combines three core components:
-1. **Conditional Normalizing Flows (CNFs):** Model dynamic, event-by-event signal resolution stretching and shape morphing initialized directly from 1D anchor fits.
-2. **Sequential ML Cascades (PyTorch DNN + XGBoost):** Learn the continuous multidimensional background density ratio directly from data via the Density Ratio Trick.
-3. **Local Covariance Inversion (Gauss-Legendre Quadrature / COWs Formalism):** Computes event-by-event local covariance matrices, translating deep-learning probabilities back into mathematically pristine, multi-dimensional sWeights.
+1. **Dynamic Signal Modeling (Splines & Flows):** Models dynamic, event-by-event signal resolution stretching and shape morphing initialized directly from 1D anchor fits, using either scale-covariant Splines or Conditional Normalizing Flows[cite: 13, 14].
+2. **Sequential ML Cascades (PyTorch DNN + XGBoost):** Learns the continuous multidimensional background density ratio directly from data via the Density Ratio Trick, separating spatial priors from mass physics[cite: 22].
+3. **Local Covariance Inversion (Local COWs):** Computes event-by-event local covariance matrices using Gauss-Legendre Quadrature, translating deep-learning probabilities back into mathematically pristine, multi-dimensional sWeights[cite: 22].
 
 The resulting multi-dimensional sWeights naturally incorporate valid negative sideband weights, eliminating spatial over-subtraction while remaining fully compatible with standard sum-of-squares (`Sum W^2`) error propagation in flat trees or `RDataFrame` workflows.
 
@@ -22,20 +22,20 @@ ml_sweights/
 │
 ├── core/
 │   ├── __init__.py
-│   ├── extractor.py        # Main MLSWeightExtractor Scikit-Learn style API
-│   ├── flow.py             # Conditional Normalizing Flow (zuko) & DynamicFlowWrapper
-│   ├── networks.py         # PyTorch DNN architectures, loss functions (uLSIF/RuLSIF/BCE)
-│   └── quadrature.py       # Gauss-Legendre quadrature for local covariance integration
+│   ├── base_extractor.py   # Core Expectation-Maximization Loop & Local COWs Inversion
+│   ├── config.py           # Configuration classes (MLSWeightConfig, FlowConfig)
+│   ├── flows.py            # Zuko-based Normalizing Flows (MCFlow1D, MCFlowND, CNFs)
+│   ├── networks.py         # PyTorch DNNs, SignedXGBClassifier, and trigonometric mappers
+│   ├── signal_models.py    # Fast exact representations (MCSpline1D, MCSpline2D, NDFlow)
+│   └── quadrature.py       # Gauss-Legendre quadrature grids for local matrix integration
 │
 ├── utils/
 │   ├── __init__.py
 │   └── diagnostics.py      # Chi2 evaluation, 1D/2D kinematic projection plotting
 │
 └── examples/
+    ├── example_base.py         # Unified CLI executable for running all physics scenarios
     ├── omega_generators.py     # Central physics toy generator (Schilling-Wolf SDMEs)
-    ├── omega_factorizable.py   # Baseline test: Uniform flat background & fixed signal
-    ├── omega_factorise_exp.py  # Factorizable test: Exponential background & iMinuit anchor
-    ├── omega_fully_dependent.py# Complex test: Correlated resolution, reflections & thresholds
     └── compare_cows_ml.py      # Direct benchmark: Standard 1D sPlot vs COWs vs ML-sWeights
 ```
 
@@ -50,94 +50,62 @@ The framework requires a Python 3.9+ environment with CUDA acceleration. Batched
 pip install numpy scipy matplotlib torch scikit-learn xgboost zuko iminuit cupy-cuda12x
 ```
 
-> **Note on GPU Execution:** Ensure `xgboost` is installed with CUDA support. The `MLSWeightExtractor` defaults to `gbdt_mode='XGB_GPU'` (`tree_method='hist'`, `device='cuda'`) to avoid PCIe bus bottlenecking during the Expectation-Maximization (EM) loop.
+> **Note on GPU Execution:** Ensure `xgboost` is installed with CUDA support. The `BaseMLSWeightExtractor` defaults to `gbdt_mode='XGB_GPU'` to avoid PCIe bus bottlenecking during the Expectation-Maximization (EM) loop[cite: 22].
 
 ---
 
-## The Example Suite
+## The Unified Example Suite
 
-The `examples/` directory contains five scripts designed to validate the mathematics, test edge cases, and demonstrate performance across varying degrees of phase-space complexity.
+The framework relies on a unified executable, `example_base.py`, to configure and deploy the EM loop against simulated photoproduction datasets. 
 
-### 1. `omega_generators.py` (Central Physics Engine)
-Contains the `OmegaToyGenerator` class, which simulates omega meson photoproduction using Schilling-Wolf Spin Density Matrix Elements (SDMEs).
-* **Signal Physics:** Generates topological angles (`cos(theta)`, `phi`, `Phi`) according to linear photon polarization (`P_gamma = 0.85`) and exponential momentum transfer (`|t|`).
-* **Modes Supported:**
-  * `'factorizable'`: Fixed Gaussian mass resolution (`sigma_m = 10 MeV`) and uniform or exponential background mass.
-  * `'correlated'`: Dynamic mass smearing dependent on `cos(theta)` and `|t|`, plus kinematic reflections and `cos(theta)`-dependent geometric acceptance thresholds.
+### Usage
 
-### 2. `omega_factorizable.py`
-* **Scenario:** Flat uniform background with a constant-resolution signal peak.
-* **Key Focus:** Serves as the fundamental baseline. Because the data is strictly factorizable, the multidimensional density ratio is flat (`R = 1.0`). 
-* **Execution:**
-  ```bash
-  python examples/omega_factorizable.py
-  ```
+```bash
+python examples/example_base.py --signal-model <MODEL_TYPE> [OPTIONS]
+```
 
-### 3. `omega_factorise_exp.py`
-* **Scenario:** Strictly factorizable kinematics, but with a steep **exponential background** mass shape.
-* **Key Focus:** Demonstrates the hybrid 1D anchor fit using `iMinuit` (Truncated Exponential x Bernstein polynomial). It shows how initializing the Conditional Normalizing Flow directly at the 1D anchor (`build_signal_flow`) prevents "downhill drift" into dense exponential sidebands.
-* **Execution:**
-  ```bash
-  python examples/omega_factorise_exp.py
-  ```
-
-### 4. `omega_fully_dependent.py`
-* **Scenario:** The ultimate non-factorizable stress test. Signal mass resolution stretches dynamically with kinematics, background features moving mass cutoffs, and kinematic reflections distort the mass shape across phase space.
-* **Key Focus:** Exercises the full power of the ML cascade. The CNF dynamically tracks signal resolution shifts, while the DNN + XGBoost cascade maps the non-linear background density ratio.
-* **Execution:**
-  ```bash
-  python examples/omega_fully_dependent.py
-  ```
-
-### 5. `compare_cows_ml.py`
-* **Scenario:** Direct side-by-side performance benchmark comparing three methods:
-  1. Standard 1D sPlot (Global Covariance Matrix).
-  2. Classical COWs (Custom Orthogonal Weight functions with fixed 1D models).
-  3. Multidimensional ML-sWeights (Dynamic Density Ratio + Local Quadrature Inversion).
-* **Key Focus:** Illustrates how standard 1D sPlot fails (carving unphysical negative pits in forward angles) under correlated resolutions, whereas ML-sWeights successfully un-biases the extracted cross-sections.
-* **Execution:**
-  ```bash
-  python examples/compare_cows_ml.py
-  ```
+### Signal Model Options (`--signal-model`)
+The framework supports scalable models depending on the dimensionality and complexity of the resolution smearing[cite: 13, 14, 20]:
+*   `spline_1d`: Fast 1D Cubic MC Spline with scale-covariant Gaussian moment matching for dynamic shifting and smearing[cite: 14].
+*   `spline_2d`: Bivariate Bicubic MC Spline with closed-form Gaussian resolution smearing[cite: 14].
+*   `flow_1d` / `flow_nd`: Unconditional Normalizing Flow trained on Cholesky-whitened coordinates[cite: 14].
+*   `cond_flow_1d` / `cond_flow_nd`: Fully Conditional Normalizing Flows (CNF) adapting dynamically to event-by-event control kinematics `x` using a Neural Spline Flow[cite: 13].
 
 ---
 
-## Configuration Guide (`MLSWeightExtractor`)
+## Configuration Guide (`BaseMLSWeightExtractor`)
 
-The `MLSWeightExtractor` class in `core/extractor.py` provides a unified Scikit-Learn style interface (`fit_transform`). Tweaking its hyperparameters allows you to tune performance between strict factorizable stability and high-capacity non-linear extraction.
+The `BaseMLSWeightExtractor` class in `core/base_extractor.py` houses the primary Expectation-Maximization logic[cite: 22].
 
 ```python
-from core import MLSWeightExtractor
+from core import BaseMLSWeightExtractor
 
-extractor = MLSWeightExtractor(
+extractor = BaseMLSWeightExtractor(
     disc_bounds=(0.73, 0.85),
-    n_nodes=40,
-    gbdt_mode='XGB_GPU',
+    n_nodes=64,
     device='cuda',
-    marginal_alpha=0.5,
-    dynamic_alpha=True,
-    use_gbdt=False,
-    reinstate_nn=True,
-    dnn_epochs=100,
-    ml_transform=False,
-    loss_fn='uLSIF',
-    logit_l2_penalty=0.05
+    gbdt_mode='XGB_GPU',
+    dnn_epochs=50,
+    warm_start=True,
+    lock_yield=True,
+    ry_smoothing=5.0,
+    extended_cows_derivatives=1,
+    omega_init=2.0,
+    omega_decay_iters=25.0
 )
 ```
 
-### Parameter Reference & Recommendations
+### Key Parameter Reference
 
-| Parameter | Type | Default | Description & Tuning Advice |
+| Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `disc_bounds` | `tuple` | *(required)* | `(Y_MIN, Y_MAX)` of the discriminating variable (e.g., invariant mass window). |
-| `loss_fn` | `str` | `'uLSIF'` | Loss function for density ratio estimation: <br>• `'uLSIF'`: Unconstrained Least-Squares Importance Fitting (recommended). <br>• `'RuLSIF'`: Relative uLSIF (bounded variance). <br>• `'BCE'`: Binary Cross-Entropy (standard classification logit). |
-| `use_gbdt` | `bool` | `True` | Toggles the sequential XGBoost residual booster: <br>• `False`: Set for **factorizable data** to prevent trees from over-fitting Poisson noise. <br>• `True`: Set for **fully dependent data** to capture sharp local residual boundaries. |
-| `logit_l2_penalty` | `float` | `0.001` | L2 regularization applied to classifier logits (z-score penalty): <br>• Increase to `0.05` for **factorizable setups** to force R(x) -> 1.0 unless strong gradients exist. <br>• Lower to `0.001` for **complex correlated setups** to allow sharp boundary learning. |
-| `marginal_alpha` | `float` | `0.5` | Initial geometric shape prior weighting (`alpha` between 0 and 1) for the marginal background correction factor. |
-| `dynamic_alpha` | `bool` | `True` | Enables the **Active Suspension Thermostat**. Automatically stiffens `alpha` to 0 if signal cannibalization is detected, or relaxes `alpha` to 1 when shapes converge stably. |
-| `reinstate_nn` | `bool` | `True` | Retrains the smooth PyTorch Deep Neural Network at the start of each EM iteration before passing residuals to XGBoost. |
-| `dnn_epochs` | `int` | `100` | Maximum training epochs per EM iteration for the PyTorch MLP (governed by Autonomous Early Stopping). |
-| `n_nodes` | `int` | `40` | Number of Gauss-Legendre numerical quadrature nodes used for local covariance matrix integrations. Higher values increase VRAM usage but improve numerical precision. |
+| `disc_bounds` | `tuple` | *(required)* | `(Y_MIN, Y_MAX)` of the discriminating variable (e.g., invariant mass window)[cite: 22]. |
+| `n_nodes` | `int` | `64` | Number of Gauss-Legendre quadrature nodes used for Local COWs matrix integrations[cite: 22]. |
+| `lock_yield` | `bool` | `True` | Synchronizes the ML density ratio spatial odds to an algebraic yield target ($N_{s,\mathrm{cows}}$) using fixed-point root finding. Set to `False` to allow organic equilibrium drift[cite: 22]. |
+| `ry_smoothing` | `float` | `5.0` | Controls the 2D Row-Wise Whittaker-Eilers Log-Spline Smoothing applied to the raw density ratio. Prevents collinearity hallucinations under the mass peak[cite: 22]. |
+| `extended_cows_derivatives` | `int` | `1` | Configures the local polynomial basis expansion for Exact Derivative COWs Inversion (1 = $3 \times 3$ matrix, 2 = $4 \times 4$ matrix). Essential for eliminating spatial bias[cite: 22]. |
+| `omega_init` | `float` | `2.0` | Initial momentum parameter for the Over-Relaxed EM Update, accelerating early phase-space exploration[cite: 22]. |
+| `warm_start` | `bool` | `True` | Carries PyTorch DNN weights across EM iterations rather than cold-starting[cite: 22]. |
 
 ---
 
@@ -146,70 +114,51 @@ extractor = MLSWeightExtractor(
 To apply this framework to your own unbinned experimental datasets:
 
 ### Step 1: Topology Mapping
-Map periodic angular variables to continuous trigonometric features to prevent neural networks from struggling at phase-space boundaries (`-pi` to `+pi`).
+Map periodic angular variables to continuous trigonometric features to prevent neural networks from struggling at phase-space boundaries (`-pi` to `+pi`). The framework provides a built-in mapper[cite: 18]:
 
 ```python
-import numpy as np
+from core.networks import map_trig_topology
 
-def map_topology(x_raw):
-    # x_raw: [cos_theta, phi, Phi]
-    cT, phi, Phi = x_raw[:, 0:1], x_raw[:, 1:2], x_raw[:, 2:3]
-    sT = np.sqrt(np.maximum(1 - cT**2, 0.0))
-    return np.hstack([cT, sT, np.cos(phi), np.sin(phi), np.cos(Phi), np.sin(Phi)])
-
-# Combine topological features with auxiliary kinematics (e.g., momentum transfer z)
-X_ctrl_data = np.hstack([map_topology(x_data), z_data])
+# Explicitly map cos(theta) and periodic phi/Phi angles
+X_ctrl_mapped = map_trig_topology(
+    x_raw, 
+    cos_theta_indices=(0,), 
+    periodic_phi_indices=(1, 2)
+)
 ```
 
-### Step 2: Initialize Signal Flow at 1D Anchor
-Fit your 1D mass distribution (e.g., using `iMinuit` or standard ROOT fits) to obtain the signal peak position (`y_peak`), signal fraction (`f0`), and baseline background function (`f_bkg_1d`). Then instantiate the signal flow:
+### Step 2: Initialize Domain-Adapted Signal Model
+Build a continuous, normalized representation of your idealized Monte Carlo signal. The framework handles dynamic shifts and scales internally[cite: 13, 20]:
 
 ```python
-from core import build_signal_flow
+from core import build_domain_adapted_signal_flow
 
-# Instantiate flow trained on pure Monte Carlo signal, locked to 1D anchor
-sig_pdf_Z = build_signal_flow(
-    Z_ctx_mc=Z_ctx_mc, 
-    y_mc=y_mc, 
+# Builds a Conditional Normalizing Flow (MCFlow1D) or Unconditional Flow
+sig_pdf_cond = build_domain_adapted_signal_flow(
+    Z_ctx_mc=X_ctrl_mc, 
+    y_mc=y_mass_mc, 
     base_loc=0.782, 
-    base_scale=0.010, 
-    peak_loc=fitted_y_peak, 
+    peak_loc=fitted_data_peak_y, 
     device='cuda'
 )
-
-def user_signal_pdf(X_ctrl, y_array):
-    # Unpack X_ctrl and pass to CNF
-    cT, cp, sp, cP, sP, z = X_ctrl[:, 0], X_ctrl[:, 2], X_ctrl[:, 3], X_ctrl[:, 4], X_ctrl[:, 5], X_ctrl[:, 6]
-    phi, Phi = np.arctan2(sp, cp), np.arctan2(sP, cP)
-    Z_ctx = np.column_stack([cT, phi, Phi, z])
-    return sig_pdf_Z(Z_ctx, y_array)
 ```
 
-### Step 3: Run Extraction
-Pass the controls and mass arrays to `MLSWeightExtractor`:
+### Step 3: Execute the Local COWs EM Loop
+Pass the mapped control variables and continuous PDFs to the `BaseMLSWeightExtractor`[cite: 22]:
 
 ```python
-extractor = MLSWeightExtractor(disc_bounds=(Y_MIN, Y_MAX), device='cuda')
+from core import BaseMLSWeightExtractor
 
+extractor = BaseMLSWeightExtractor(disc_bounds=(Y_MIN, Y_MAX), device='cuda')
+
+# Returns publication-ready statistical sWeights array
 sWeights_ND = extractor.fit_transform(
-    X_ctrl=X_ctrl_data,
-    y_disc=y_data,
-    w_s_init=w_s_bayes_init,
-    f_sig_cond=user_signal_pdf,
-    f_bkg_1d=f_bkg_1d_callable,
-    bkg_sampler=bkg_rejection_sampler_func,
+    X_ctrl=X_ctrl_mapped,
+    y_disc=y_data_array,
+    w_s_init=initial_bayes_prob_guess,
+    f_sig_cond=sig_pdf_cond,
+    f_bkg_1d=f_bkg_1d_callable,      # Your baseline anchor background fit
+    bkg_sampler=bkg_rejection_func,  # Fast sampler for the 1D anchor baseline
     max_iters=30
 )
-
-# Extract event weights and store in ROOT RDataFrame / Pandas
-# sWeights_ND contains publication-ready event weights!
 ```
-
----
-
-## Summary of Configuration Setups
-
-| Scenario | `use_gbdt` | `logit_l2_penalty` | Primary Goal |
-| :--- | :--- | :--- | :--- |
-| **Factorizable Check** (`omega_factorizable.py`, `omega_factorise_exp.py`) | `False` | `0.05` | Suppresses noise fitting, ensuring R -> 1.0 and matching classic 1D sPlot. |
-| **Fully Dependent Physics** (`omega_fully_dependent.py`) | `True` | `0.001` | Maximizes model capacity to capture dynamic smearing and kinematic reflections. |

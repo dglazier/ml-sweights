@@ -5,7 +5,6 @@ import torch
 def plot_2d_hist(ax, fig, x_arr, y_arr, w_arr, range_bounds, title, xlabel, ylabel, vmin=None, vmax=None, cmap='viridis'):
     counts, _, _ = np.histogram2d(x_arr, y_arr, bins=30, range=range_bounds, weights=w_arr)
     
-    # Auto-scale symmetric diverging colormaps if limits aren't provided
     if vmin is None and vmax is None:
         max_abs = np.max(np.abs(counts))
         if max_abs == 0: max_abs = 1e-6
@@ -46,7 +45,7 @@ def plot_stacked_1d(x_data, w_s, bounds_list, labels_list):
         if i==0: axs1[i].legend()
     plt.tight_layout()
 
-def plot_final_1d_projections(x_data, x_sig_true, x_bkg_true, sWeights_1D, sWeights_MD, bounds_list, labels_list, w_prob=None):
+def plot_final_1d_projections(x_data, x_sig_true, x_bkg_true, sWeights_1D, sWeights_MD, bounds_list, labels_list, w_prob=None, w_true=None):
     fig2, axs2 = plt.subplots(2, 3, figsize=(18, 10))
     fig2.suptitle(r"Final 1D Projection: Standard 1D $sPlot$ vs Rigorous ND $sWeights$", fontsize=16)
     
@@ -54,8 +53,13 @@ def plot_final_1d_projections(x_data, x_sig_true, x_bkg_true, sWeights_1D, sWeig
         bins = np.linspace(bounds_list[i][0], bounds_list[i][1], 30)
         
         # Signal Row
-        axs2[0, i].hist(x_sig_true[:, i], bins=bins, histtype='step', color='black', lw=2, label="True Signal")
-        axs2[0, i].hist(x_data[:, i], bins=bins, weights=sWeights_1D, histtype='step', color='orange', linestyle='--', lw=3, alpha=0.8, label="1D sPlot")
+        if x_sig_true is not None:
+            if w_true is not None:
+                axs2[0, i].hist(x_sig_true[:, i], bins=bins, weights=w_true, histtype='step', color='black', lw=2, label="1D sPlot Ref")
+            else:
+                axs2[0, i].hist(x_sig_true[:, i], bins=bins, histtype='step', color='black', lw=2, label="True Signal")
+                
+        axs2[0, i].hist(x_data[:, i], bins=bins, weights=sWeights_1D, histtype='step', color='orange', linestyle='--', lw=3, alpha=0.8, label="1D Anchor Fit")
         axs2[0, i].hist(x_data[:, i], bins=bins, weights=sWeights_MD, histtype='step', color='blue', lw=2, label="ND sWeights")
         if w_prob is not None:
             axs2[0, i].hist(x_data[:, i], bins=bins, weights=w_prob, histtype='step', color='magenta', lw=1.5, alpha=0.9, label="ML Prob Weights")
@@ -64,11 +68,16 @@ def plot_final_1d_projections(x_data, x_sig_true, x_bkg_true, sWeights_1D, sWeig
         if i==0: axs2[0, i].legend(loc='lower center')
         
         # Background Row
-        axs2[1, i].hist(x_bkg_true[:, i], bins=bins, histtype='step', color='gray', lw=2, label="True Background")
-        axs2[1, i].hist(x_data[:, i], bins=bins, weights=(1-sWeights_1D), histtype='step', color='lightgreen', linestyle='--', lw=2, alpha=0.8, label="1D sPlot")
-        axs2[1, i].hist(x_data[:, i], bins=bins, weights=(1-sWeights_MD), histtype='step', color='purple', lw=2, label="ND sWeights")
+        if x_bkg_true is not None:
+            if w_true is not None:
+                axs2[1, i].hist(x_bkg_true[:, i], bins=bins, weights=(1-w_true), histtype='step', color='gray', lw=2, label="1D sPlot Bkg Ref")
+            else:
+                axs2[1, i].hist(x_bkg_true[:, i], bins=bins, histtype='step', color='gray', lw=2, label="True Background")
+                
+        axs2[1, i].hist(x_data[:, i], bins=bins, weights=(1-sWeights_1D), histtype='step', color='lightgreen', linestyle='--', lw=2, alpha=0.8, label="1D Anchor Bkg")
+        axs2[1, i].hist(x_data[:, i], bins=bins, weights=(1-sWeights_MD), histtype='step', color='purple', lw=2, label="ND sWeights Bkg")
         if w_prob is not None:
-            axs2[1, i].hist(x_data[:, i], bins=bins, weights=(1-w_prob), histtype='step', color='magenta', lw=1.5, alpha=0.9, label="ML Prob Weights")
+            axs2[1, i].hist(x_data[:, i], bins=bins, weights=(1-w_prob), histtype='step', color='magenta', lw=1.5, alpha=0.9, label="ML Prob Weights Bkg")
         
         axs2[1, i].set_title(f"Extracted Background {labels_list[i]}")
         if i==0: axs2[1, i].legend(loc='lower center')
@@ -98,7 +107,6 @@ def plot_2d_correlations(x_data, x_true, w_1d, w_md, axes_pairs, bounds_list, is
         range_x = bounds_list[idx_x]
         range_y = bounds_list[idx_y]
         
-        # Globally lock the Z-axis limits for this column (variable pair)
         c_vmin, c_vmax = 0, 0
         for r in range(n_rows):
             curr_data, curr_weights, row_title = sources[r]
@@ -109,16 +117,13 @@ def plot_2d_correlations(x_data, x_true, w_1d, w_md, axes_pairs, bounds_list, is
             
         for r in range(n_rows):
             curr_data, curr_weights, row_title = sources[r]
-            
             if "Diff" in row_title:
-                # Differences are forced to diverge symmetrically around zero
                 counts, _, _ = np.histogram2d(curr_data[:, idx_x], curr_data[:, idx_y], bins=30, range=[range_x, range_y], weights=curr_weights)
                 diff_max = np.max(np.abs(counts))
                 if diff_max == 0: diff_max = 1e-6
                 plot_2d_hist(axs3[r, c], fig3, curr_data[:, idx_x], curr_data[:, idx_y], curr_weights, 
                              [range_x, range_y], row_title if c==0 else "", lbl_x, lbl_y, vmin=-diff_max, vmax=diff_max, cmap='coolwarm')
             else:
-                # Densities all uniformly share the exact same scale and color map
                 plot_2d_hist(axs3[r, c], fig3, curr_data[:, idx_x], curr_data[:, idx_y], curr_weights, 
                              [range_x, range_y], row_title if c==0 else "", lbl_x, lbl_y, vmin=c_vmin, vmax=c_vmax, cmap='viridis')
                 
@@ -159,7 +164,6 @@ def plot_sliced_y_grids(x_raw, X_ctrl, y_data, w_sig, bounds_list,
             idx_slice = np.random.choice(np.where(mask)[0], min(500, n_events), replace=False)
             
             X_ctrl_slice = X_ctrl[idx_slice]
-            
             fs_slice = np.zeros_like(y_grid_diag)
             fb_slice = np.zeros_like(y_grid_diag)
             
@@ -221,7 +225,6 @@ def plot_sliced_y_grids(x_raw, X_ctrl, y_data, w_sig, bounds_list,
                     fb_slice[j] = np.mean((fb_base[j] * R_dnn * R_gbdt * C_y) / np.maximum(Z_b_slice, 1e-10))
 
             N_s_slice, N_b_slice = np.sum(w_sig[mask]), np.sum(1 - w_sig[mask])
-            
             sig_pdf_scaled = N_s_slice * fs_slice * bin_width
             bkg_pdf_scaled = N_b_slice * fb_slice * bin_width
             tot_slice = sig_pdf_scaled + bkg_pdf_scaled
@@ -229,26 +232,27 @@ def plot_sliced_y_grids(x_raw, X_ctrl, y_data, w_sig, bounds_list,
             ax.plot(y_grid_diag, tot_slice, 'r--', lw=2, label='Total PDF')
             ax.plot(y_grid_diag, bkg_pdf_scaled, 'b:', lw=2, label='Bkg PDF')
             ax.plot(y_grid_diag, sig_pdf_scaled, 'g-.', lw=1, alpha=0.8, label='Sig PDF')
-            
             ax.set_title(rf"{slice_bins[i]:.2f} $\leq$ {var_name} < {slice_bins[i+1]:.2f} (N={n_events})")
             if i == 0: ax.legend(loc='best', fontsize='small')
         
         plt.tight_layout()
         plt.pause(0.5)
 
-def get_chi2(x_raw, w_s, x_true, bounds=None, bins=50):
+def get_chi2(x_raw, w_s, x_true, bounds=None, bins=50, w_true=None):
     chi2s = []
     n_dims = x_raw.shape[1] if len(x_raw.shape) > 1 else 1
     x_r = x_raw.reshape(-1, n_dims)
-    x_t = x_true.reshape(-1, n_dims)
+    x_t = x_true.reshape(-1, n_dims) if x_true is not None else None
     
+    if x_t is None: return []
+
     for i in range(n_dims):
         b_min, b_max = bounds[i] if (bounds and i < len(bounds)) else (np.min(x_r[:, i]), np.max(x_r[:, i]))
         
         hist_ext, bin_edges = np.histogram(x_r[:, i], bins=bins, range=(b_min, b_max), weights=w_s)
-        hist_true, _ = np.histogram(x_t[:, i], bins=bin_edges)
+        hist_true, _ = np.histogram(x_t[:, i], bins=bin_edges, weights=w_true)
         
-        if np.sum(hist_ext) > 0:
+        if np.sum(hist_ext) > 0 and np.sum(hist_true) > 0:
             hist_ext = hist_ext * (np.sum(hist_true) / np.sum(hist_ext))
             
         mask = hist_true > 0
@@ -259,7 +263,7 @@ def get_chi2(x_raw, w_s, x_true, bounds=None, bins=50):
             chi2s.append(chi2)
     return chi2s
 
-def plot_dynamic_iteration(x_raw, w_s, x_true, bounds, labels, it, chi2s, y_grid_cpu=None, correction_grid=None, y_raw=None, y_bounds=None):
+def plot_dynamic_iteration(x_raw, w_s, x_true, bounds, labels, it, chi2s, y_grid_cpu=None, correction_grid=None, y_raw=None, y_bounds=None, w_true=None):
     plt.ion() 
     try:
         from IPython.display import clear_output
@@ -269,7 +273,7 @@ def plot_dynamic_iteration(x_raw, w_s, x_true, bounds, labels, it, chi2s, y_grid
     
     n_dims = x_raw.shape[1] if len(x_raw.shape) > 1 else 1
     x_r = x_raw.reshape(-1, n_dims)
-    x_t = x_true.reshape(-1, n_dims)
+    x_t = x_true.reshape(-1, n_dims) if x_true is not None else None
     
     n_cols = n_dims + (1 if y_raw is not None else 0) + (1 if correction_grid is not None else 0)
         
@@ -285,19 +289,24 @@ def plot_dynamic_iteration(x_raw, w_s, x_true, bounds, labels, it, chi2s, y_grid
         lbl = labels[i] if (labels and i < len(labels)) else f"Var {i}"
         
         plt.hist(x_r[:, i], bins=40, range=(b_min, b_max), color='gray', alpha=0.3, label='Total Data')
-        plt.hist(x_t[:, i], bins=40, range=(b_min, b_max), histtype='step', color='black', lw=2, label='True Signal')
-        plt.hist(x_r[:, i], bins=40, range=(b_min, b_max), weights=w_s, histtype='step', color='blue', lw=2, label='ND sWeights')
-        plt.hist(x_r[:, i], bins=40, range=(b_min, b_max), weights=(1.0 - w_s), histtype='step', color='red', ls='--', lw=2, label='ND sWeights Bkg')
+        if x_t is not None:
+            if w_true is not None:
+                plt.hist(x_t[:, i], bins=40, range=(b_min, b_max), weights=w_true, histtype='step', color='black', lw=2, label='1D sPlot Ref')
+            else:
+                plt.hist(x_t[:, i], bins=40, range=(b_min, b_max), histtype='step', color='black', lw=2, label='True Signal')
         
-        plt.title(f"{lbl} | Iter {it} | $\chi^2$: {chi2s[i]:.1f}")
+        plt.hist(x_r[:, i], bins=40, range=(b_min, b_max), weights=w_s, histtype='step', color='blue', lw=2, label='ML Prob Weights')
+        plt.hist(x_r[:, i], bins=40, range=(b_min, b_max), weights=(1.0 - w_s), histtype='step', color='red', ls='--', lw=2, label='ML Prob Bkg')
+        
+        plt.title(f"{lbl} | Iter {it} | $\chi^2$: {chi2s[i]:.1f}" if i < len(chi2s) else f"{lbl} | Iter {it}")
         plt.legend(loc='upper right', fontsize='small')
         
     if y_raw is not None and y_bounds is not None:
         plt.subplot(1, n_cols, col_idx)
         col_idx += 1
         plt.hist(y_raw, bins=50, range=y_bounds, color='gray', alpha=0.3, label='Total Data')
-        plt.hist(y_raw, bins=50, range=y_bounds, weights=w_s, histtype='step', color='blue', lw=2, label='ND sWeights')
-        plt.hist(y_raw, bins=50, range=y_bounds, weights=(1.0 - w_s), histtype='step', color='red', ls='--', lw=2, label='ND sWeights Bkg')
+        plt.hist(y_raw, bins=50, range=y_bounds, weights=w_s, histtype='step', color='blue', lw=2, label='ML Prob Weights')
+        plt.hist(y_raw, bins=50, range=y_bounds, weights=(1.0 - w_s), histtype='step', color='red', ls='--', lw=2, label='ML Prob Bkg')
         
         plt.title("Discriminant Variable (y)")
         plt.legend(loc='upper right', fontsize='small')
