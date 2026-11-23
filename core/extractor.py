@@ -3,6 +3,7 @@ import torch
 import time
 import copy
 import logging
+import scipy.ndimage  # <-- Added for Gaussian smoothing
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 try:
@@ -29,7 +30,8 @@ class MLSWeightExtractor:
                  use_relu=True, reinstate_nn=False, 
                  marginal_alpha=1.0, dynamic_alpha=False, 
                  use_gbdt=True, dnn_epochs=50, ml_transform=None,
-                 loss_fn='BCE', logit_l2_penalty=0.0):
+                 loss_fn='BCE', logit_l2_penalty=0.0, 
+                 yield_boost=0.0, ry_smoothing=1.5):  # <-- NEW RUNTIME PARAMETER
         
         self.y_min, self.y_max = disc_bounds
         self.n_nodes = n_nodes
@@ -43,6 +45,8 @@ class MLSWeightExtractor:
         self.ml_transform = ml_transform 
         self.loss_fn = loss_fn 
         self.logit_l2_penalty = logit_l2_penalty 
+        self.yield_boost = yield_boost
+        self.ry_smoothing = ry_smoothing  # <-- STORED PARAMETER
         
         self.gbdt_mode = gbdt_mode if self.use_gbdt else 'NONE'
         if self.gbdt_mode == 'XGB_GPU' and (xgb is None or not torch.cuda.is_available()):
@@ -199,6 +203,16 @@ class MLSWeightExtractor:
             I_margin_t = torch.sum(f_margin_grid_t * dy_weights_t)
             
             correction_factor_grid_t = (I_margin_t / torch.clamp(I_base_t, min=1e-10)) / torch.clamp(R_y_margin_t, min=1e-10)
+            
+            # -------------------------------------------------------------
+            # NEW HANDLE: ENFORCE BACKGROUND SMOOTHNESS UNDER SIGNAL PEAK
+            # -------------------------------------------------------------
+            if self.ry_smoothing > 0.0:
+                corr_cpu = correction_factor_grid_t.cpu().numpy()
+                corr_smoothed = scipy.ndimage.gaussian_filter1d(corr_cpu, sigma=self.ry_smoothing)
+                correction_factor_grid_t = torch.tensor(corr_smoothed, dtype=torch.float32, device=self.device)
+            # -------------------------------------------------------------
+            
             self.correction_grid_t = torch.pow(correction_factor_grid_t, current_alpha)
             
             correction_interp_data_t = torch_interp1d(y_disc_t, y_grid_t, self.correction_grid_t)
@@ -251,7 +265,16 @@ class MLSWeightExtractor:
             kl_divergence = (torch.sum(w_s_safe_t * log_A_t) / torch.sum(w_s_safe_t)).item()
             kl_history.append(kl_divergence)
             
-            w_s_bayes_t = (fs_local_t * A_final_data_t) / torch.clamp((fs_local_t * A_final_data_t) + fb_local_t, min=1e-12)
+            # -------------------------------------------------------------
+            # NEW IMPLEMENTATION: OPTIONAL YIELD BOOST CONSTRAINT
+            # -------------------------------------------------------------
+            if self.yield_boost > 0.0:
+                fs_norm = fs_local_t / torch.clamp(torch.max(fs_local_t), min=1e-12)
+                fb_effective = torch.clamp(fb_local_t * (1.0 - self.yield_boost * fs_norm), min=1e-12)
+            else:
+                fb_effective = fb_local_t
+
+            w_s_bayes_t = (fs_local_t * A_final_data_t) / torch.clamp((fs_local_t * A_final_data_t) + fb_effective, min=1e-12)
             w_s_t = torch.clamp(w_s_prev_t + omega_curr * (w_s_bayes_t - w_s_prev_t), 0.0, 1.0)
             
             current_Ns = torch.sum(w_s_t).item()
@@ -262,7 +285,6 @@ class MLSWeightExtractor:
             # CORRECTION: MACROSCOPIC YIELD STABILIZATION (Yield Shift vs delta_w)
             # -------------------------------------------------------------
             fractional_yield_shift = abs(delta_Ns) / max(current_Ns, 1.0)
-            delta_w = torch.mean(torch.abs(w_s_t - w_s_prev_t)).item()
             
             if cooldown > 0:
                 cooldown -= 1
@@ -279,31 +301,43 @@ class MLSWeightExtractor:
                     cooldown = 2
             
             if validation_data is not None:
-                from utils.diagnostics import get_chi2
+                from utils.diagnostics import get_chi2, plot_dynamic_iteration
                 w_s_cpu = w_s_t.cpu().numpy()
-                chi2s = get_chi2(validation_data['x_raw'], w_s_cpu, validation_data['x_true'], validation_data['bounds'])
-                chi2_str = ", ".join([f"{c:.1f}" for c in chi2s])
-                current_metric = np.mean(chi2s) 
                 
-                logger.info(f"Iter {it:02d} [ω={omega_curr:.2f}, α={current_alpha:.2f}] | S: {current_Ns:.0f} (dNs: {delta_Ns:+.0f}) | "
-                            f"Chi2: [{chi2_str}] | <KL>: {kl_divergence:.4f} | Yield Shift: {fractional_yield_shift:.5f}")
+                if validation_data.get('x_true') is not None:
+                    chi2s = get_chi2(validation_data['x_raw'], w_s_cpu, validation_data['x_true'], 
+                                     validation_data['bounds'], w_true=validation_data.get('w_true', None))
+                    chi2_str = ", ".join([f"{c:.1f}" for c in chi2s])
+                else:
+                    chi2s = []
+                    chi2_str = "N/A"
+                    
+                if validation_data.get('real_data_metric', False):
+                    current_metric = fractional_yield_shift - (0.1 * kl_divergence)
+                    logger.info(f"Iter {it:02d} [ω={omega_curr:.2f}, α={current_alpha:.2f}] | S: {current_Ns:.0f} (dNs: {delta_Ns:+.0f}) | "
+                                f"Ref Chi2: [{chi2_str}] | <KL>: {kl_divergence:.4f} | Yield Shift: {fractional_yield_shift:.5f}")
+                else:
+                    current_metric = np.mean(chi2s) if len(chi2s) > 0 else 0.0
+                    logger.info(f"Iter {it:02d} [ω={omega_curr:.2f}, α={current_alpha:.2f}] | S: {current_Ns:.0f} (dNs: {delta_Ns:+.0f}) | "
+                                f"Chi2: [{chi2_str}] | <KL>: {kl_divergence:.4f} | Yield Shift: {fractional_yield_shift:.5f}")
 
                 if validation_data.get('plot_iterations', False):
-                    from utils.diagnostics import plot_dynamic_iteration
                     corr_grid_cpu = self.correction_grid_t.cpu().numpy() if self.correction_grid_t is not None else None
-                    
                     plot_dynamic_iteration(
-                        validation_data['x_raw'], w_s_cpu, validation_data['x_true'], 
-                        validation_data['bounds'], validation_data.get('labels', None), 
-                        it, chi2s, self.y_grid_cpu, corr_grid_cpu,
-                        validation_data.get('y_raw', None), validation_data.get('y_bounds', None) 
+                        x_raw=validation_data['x_raw'], 
+                        w_s=w_s_cpu, 
+                        x_true=validation_data.get('x_true'), 
+                        bounds=validation_data['bounds'], 
+                        labels=validation_data.get('labels', None), 
+                        it=it, 
+                        chi2s=chi2s, 
+                        y_grid_cpu=self.y_grid_cpu, 
+                        correction_grid=corr_grid_cpu,
+                        y_raw=validation_data.get('y_raw', None), 
+                        y_bounds=validation_data.get('y_bounds', None),
+                        w_true=validation_data.get('w_true', None)
                     )
             else:
-                # -------------------------------------------------------------
-                # CORRECTION: METRIC WITHOUT VALIDATION DATA (Penalize KL drops)
-                # -------------------------------------------------------------
-                # We want small yield shifts and high KL (to avoid cannibalization).
-                # Subtracting KL means higher KL yields a smaller/better metric.
                 current_metric = fractional_yield_shift - (0.1 * kl_divergence)
                 logger.info(f"Iter {it:02d} [ω={omega_curr:.2f}, α={current_alpha:.2f}] | S: {current_Ns:.0f} (dNs: {delta_Ns:+.0f}) | "
                             f"<KL>: {kl_divergence:.4f} | Yield Shift: {fractional_yield_shift:.5f}")
@@ -323,9 +357,6 @@ class MLSWeightExtractor:
                         
                     best_iter = it
             
-            # -------------------------------------------------------------
-            # CORRECTION: LOOP TERMINATION CRITERIA
-            # -------------------------------------------------------------
             if fractional_yield_shift < tol and it > 5:
                 stable_iters += 1
             else:
@@ -377,35 +408,14 @@ class MLSWeightExtractor:
                 y_b = y_disc[start_idx:end_idx]
                 z_b = self.ml_transform(x_b) if self.ml_transform else x_b
                 
-                # -------------------------------------------------------------
-                # BUG FIX: Evaluate Model B to get the Signal Morphing Ratio (A)
-                # -------------------------------------------------------------
                 z_b_t = torch.tensor(z_b, dtype=torch.float32, device=self.device)
-                if self.model_B is not None:
-                    A_dnn_obs = torch.exp(torch.clamp(self.model_B(z_b_t), -15, 15)).cpu().numpy().flatten()
-                    if getattr(self, 'gbdt_B', None) is not None:
-                        if self.gbdt_mode == 'XGB_GPU':
-                            p_gbdt_B = self.gbdt_B.predict_proba(z_b_t)[:, 1]
-                            if isinstance(p_gbdt_B, torch.Tensor): p_gbdt_B = p_gbdt_B.cpu().numpy()
-                            A_gbdt_obs = np.clip(p_gbdt_B, 1e-7, 1-1e-7) / (1.0 - np.clip(p_gbdt_B, 1e-7, 1-1e-7))
-                        elif self.gbdt_mode == 'SKLEARN':
-                            p_gbdt_B = np.clip(self.gbdt_B.predict_proba(z_b)[:, 1], 1e-7, 1-1e-7)
-                            A_gbdt_obs = p_gbdt_B / (1.0 - p_gbdt_B)
-                        else:
-                            A_gbdt_obs = np.ones(batch_len)
-                    else:
-                        A_gbdt_obs = np.ones(batch_len)
-                    A_final_obs = A_dnn_obs * A_gbdt_obs
-                else:
-                    A_final_obs = np.ones(batch_len)
                 
                 Z_eval_obs_t = torch.cat([
                     z_b_t,
                     torch.tensor(y_b, dtype=torch.float32, device=self.device).unsqueeze(1)
                 ], dim=1)
                 
-                # Apply the Morphing Ratio (A) to the conditional signal shape!
-                fs_obs_raw = f_sig_cond(z_b, y_b) * A_final_obs
+                fs_obs_raw = f_sig_cond(z_b, y_b) 
                 fb_base_obs = f_bkg_1d(y_b)
                 
                 R_dnn_obs = torch.exp(torch.clamp(self.model_A(Z_eval_obs_t), -15, 15)).cpu().numpy().flatten()
@@ -438,8 +448,7 @@ class MLSWeightExtractor:
                 z_b_repeated = np.repeat(z_b, self.n_nodes, axis=0)
                 y_tiled = np.tile(self.y_grid_cpu, batch_len)
                 
-                # Apply the Morphing Ratio (A) to the integration grid!
-                fs_grid_raw = f_sig_cond(z_b_repeated, y_tiled).reshape(batch_len, self.n_nodes) * A_final_obs[:, None]
+                fs_grid_raw = f_sig_cond(z_b_repeated, y_tiled).reshape(batch_len, self.n_nodes)
                 
                 Z_eval_grid_t = torch.cat([
                     torch.tensor(z_b_repeated, dtype=torch.float32, device=self.device),
