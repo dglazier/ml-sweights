@@ -9,10 +9,8 @@ try:
 except ImportError:
     xgb = None
 
-from .networks import PureDNN, train_dnn, predict_in_batches
 from .quadrature import get_gauss_legendre_grid
-from .extractor import SignedXGBClassifier
-
+from .networks import PureDNN, train_dnn, predict_in_batches, SignedXGBClassifier
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
@@ -303,7 +301,7 @@ class BaseMLSWeightExtractor:
 
             if self.gbdt_mode == 'XGB_GPU' and xgb is not None:
                 w_train_A_gbdt = np.concatenate([w_num, w_num * R_DNN_ref_t.cpu().numpy()])
-                self.gbdt_A = SignedXGBClassifier(n_estimators=10, max_depth=2, learning_rate=0.1, device=self.device)
+                self.gbdt_A = SignedXGBClassifier(n_estimators=8, max_depth=16, learning_rate=0.1, device=self.device)
                 self.gbdt_A.fit(X_train_A, y_train_A, sample_weight=w_train_A_gbdt)
                 
                 p_data_np = np.clip(self.gbdt_A.predict_proba(X_targ_A_np)[:, 1], 1e-7, 1-1e-7)
@@ -350,7 +348,7 @@ class BaseMLSWeightExtractor:
                 
             if self.gbdt_mode == 'XGB_GPU' and xgb is not None:
                 w_train_B_gbdt = np.concatenate([w_in_cpu * w_s_cpu, w_in_cpu * w_b_cpu * A_DNN_data_t.cpu().numpy()])
-                self.gbdt_B = SignedXGBClassifier(n_estimators=40, max_depth=4, learning_rate=0.1, device=self.device)
+                self.gbdt_B = SignedXGBClassifier(n_estimators=8, max_depth=16, learning_rate=0.1, device=self.device)
                 self.gbdt_B.fit(X_train_B, y_train_B, sample_weight=w_train_B_gbdt)
                 p_phys_np = np.clip(self.gbdt_B.predict_proba(X_ctrl)[:, 1], 1e-7, 1-1e-7)
                 A_GBDT_data_t = torch.tensor(p_phys_np / (1.0 - p_phys_np), dtype=torch.float32, device=self.device)

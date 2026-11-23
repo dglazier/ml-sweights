@@ -5,7 +5,10 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader, random_split
 import numpy as np
 import logging
-
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
 logger = logging.getLogger(__name__)
 
 
@@ -215,3 +218,56 @@ def predict_in_batches(model, X_tensor, batch_size=32768):
             preds.append(logits)
             
     return torch.cat(preds, dim=0)
+# ==============================================================================
+# SIGNED-BCE GBDT WRAPPER (drWeights Exact Loss Formulation)
+# ==============================================================================
+class SignedXGBClassifier:
+    def __init__(self, n_estimators=50, max_depth=4, learning_rate=0.1,
+                 min_child_weight=5.0, reg_lambda=2.0, device='cuda'):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.min_child_weight = min_child_weight
+        self.reg_lambda = reg_lambda
+        self.device = device
+        self.booster = None
+
+    def fit(self, X, y, sample_weight):
+        X_np = X.detach().cpu().numpy() if isinstance(X, torch.Tensor) else np.asarray(X, dtype=np.float32)
+        y_np = y.detach().cpu().numpy().astype(np.float32) if isinstance(y, torch.Tensor) else np.asarray(y, dtype=np.float32)
+        w_np = sample_weight.detach().cpu().numpy().astype(np.float32) if isinstance(sample_weight, torch.Tensor) else np.asarray(sample_weight, dtype=np.float32)
+
+        w_scale = float(np.mean(np.abs(w_np))) + 1e-12
+        w_norm = w_np / w_scale
+
+        dtrain = xgb.DMatrix(X_np, label=y_np)
+        params = {
+            'max_depth': self.max_depth,
+            'learning_rate': self.learning_rate,
+            'tree_method': 'hist',
+            'device': self.device,
+            'min_child_weight': self.min_child_weight,
+            'reg_lambda': self.reg_lambda,
+            'base_score': 0.0,
+            'verbosity': 0
+        }
+
+        def signed_bce_obj(preds: np.ndarray, dmat: xgb.DMatrix):
+            z = np.clip(preds, -15.0, 15.0)
+            p = 1.0 / (1.0 + np.exp(-z))
+            grad = w_norm * (p - y_np)
+            hess = w_norm * p * (1.0 - p)
+            return grad, hess
+
+        self.booster = xgb.train(
+            params, dtrain, num_boost_round=self.n_estimators, obj=signed_bce_obj
+        )
+        return self
+
+    def predict_proba(self, X):
+        X_np = X.detach().cpu().numpy() if isinstance(X, torch.Tensor) else np.asarray(X, dtype=np.float32)
+        dtest = xgb.DMatrix(X_np)
+        margins = self.booster.predict(dtest, output_margin=True)
+        z = np.clip(margins, -15.0, 15.0)
+        p1 = 1.0 / (1.0 + np.exp(-z))
+        return np.column_stack([1.0 - p1, p1])

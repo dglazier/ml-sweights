@@ -82,12 +82,12 @@ def main():
     parser.add_argument("--data-seed", type=int, default=43, help="Fixed random seed")
     parser.add_argument("--n-runs", type=int, default=1, help="Number of independent ML runs to average")
     parser.add_argument("--max-iters", type=int, default=30, help="Maximum EM iterations")
-    parser.add_argument("--n-nodes", type=int, default=50, help="Number of Gauss-Legendre quadrature nodes")
+    parser.add_argument("--n-nodes", type=int, default=64, help="Number of Gauss-Legendre quadrature nodes")
     parser.add_argument("--alpha", type=float, default=1.00, help="Fixed marginal alpha prior")
     parser.add_argument("--signal-model", type=str, default="flow_1d",
                         choices=["spline", "flow_1d", "cond_flow_1d"],
                         help="Signal model: spline (MCSpline1D), flow_1d (Unconditional 1D Flow), or cond_flow_1d (Conditional 1D Flow)")
-    parser.add_argument("--derivs", type=int, default=0, help="Extended local COWs derivatives (0, 1, or 2)")
+    parser.add_argument("--derivs", type=int, default=2, help="Extended local COWs derivatives (0, 1, or 2)")
     parser.add_argument("--bern-degree", type=int, default=2, help="Bernstein polynomial degree for 1D COWs baselines")
     args = parser.parse_args()
 
@@ -100,9 +100,9 @@ def main():
     factory = OmegaToyGenerator()
     Y_MIN, Y_MAX = 0.73, 0.84
     
-    x_s, z_s, m_inv_s, m_mm_s, t_s = factory.generate_signal(8000, is_data=True, phase_space_cut=True)
-    x_b1, z_b1, m_inv_b1, m_mm_b1, t_b1 = factory.generate_background(60000, bkg_type='combinatorial', phase_space_cut=True)
-    x_b2, z_b2, m_inv_b2, m_mm_b2, t_b2 = factory.generate_background(30000, bkg_type='out_of_time', phase_space_cut=True)
+    x_s, z_s, m_inv_s, m_mm_s, t_s = factory.generate_signal(8000, is_data=True, phase_space_cut=False)
+    x_b1, z_b1, m_inv_b1, m_mm_b1, t_b1 = factory.generate_background(60000, bkg_type='combinatorial', phase_space_cut=False)
+    x_b2, z_b2, m_inv_b2, m_mm_b2, t_b2 = factory.generate_background(30000, bkg_type='out_of_time', phase_space_cut=False)
 
     x_data_full = np.vstack([x_s, x_b1, x_b2])
     z_data_full = np.concatenate([z_s, z_b1, z_b2])
@@ -153,7 +153,7 @@ def main():
     print("\n=======================================================================")
     print("3. Generating Exact MC Signal Templates...")
     print("=======================================================================")
-    x_mc, z_mc, m_inv_mc, _, _ = factory.generate_signal(500000, is_data=False, phase_space_cut=True)
+    x_mc, z_mc, m_inv_mc, _, _ = factory.generate_signal(500000, is_data=False, phase_space_cut=False)
     mc_mask = (m_inv_mc >= Y_MIN) & (m_inv_mc <= Y_MAX)
     x_mc = x_mc[mc_mask]
     z_mc = z_mc[mc_mask]

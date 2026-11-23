@@ -17,16 +17,16 @@ from .networks import (
     PureDNN, 
     train_dnn, 
     predict_in_batches, 
-    map_trig_topology
+    map_trig_topology,
+    SignedXGBClassifier  # <--- Add this if you want it exposed at the package level
 )
 from .signal_models import (
     MCSpline1D, 
     MCSpline2D, 
     UnconditionalNDFlow
 )
-from .extractor import MLSWeightExtractor
-from .extractor_2d import MLSWeightExtractor2D
-from .sequential import SequentialMLSWeightExtractor
+#from .extractor_2d import MLSWeightExtractor2D
+#from .sequential import SequentialMLSWeightExtractor
 from .base_extractor import BaseMLSWeightExtractor
 
 __all__ = [
@@ -44,6 +44,7 @@ __all__ = [
     "train_dnn",
     "predict_in_batches",
     "map_trig_topology",
+    "SignedXGBClassifier", # <--- Added here
     "train_flow_model",
     "DynamicFlowWrapper",
     "calibrate_flow_model",
@@ -53,9 +54,6 @@ __all__ = [
     "MCSpline1D",
     "MCSpline2D",
     "UnconditionalNDFlow",
-    "MLSWeightExtractor",
-    "MLSWeightExtractor2D",
-    "SequentialMLSWeightExtractor",
     "BaseMLSWeightExtractor",
     "torch_interp1d",
     "torch_interp2d",
